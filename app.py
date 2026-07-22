@@ -11,6 +11,10 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+import anthropic
+
+# Read API key from Streamlit secrets
+api_key = st.secrets["ANTHROPIC_API_KEY"]
 
 # ── Page config — must be first st. call ──────────
 st.set_page_config(
@@ -68,6 +72,56 @@ def build_model():
 
     return df, importance
 
+def build_system_prompt(df, high_risk, med_risk, low_risk, priority, importance):
+    top_driver    = importance.iloc[0]['feature']
+    top_protector = importance.iloc[-1]['feature']
+    spend_high = high_risk['monthly_spend'].mean()
+    spend_low  = low_risk['monthly_spend'].mean()
+    avg_comp_high = high_risk['num_complaints'].mean()
+    avg_comp_low  = low_risk['num_complaints'].mean()
+    return f"""You are an AI churn analyst embedded in a telecom analytics dashboard.
+Answer questions using ONLY the figures below. Never invent numbers.
+If a question cannot be answered from this data, say so clearly.
+
+=== DATA SUMMARY ===
+Total customers:        {len(df)}
+Overall churn rate:     {df['churned'].mean():.1%}
+High risk  (>70%):      {len(high_risk)} customers ({len(high_risk)/len(df):.1%})
+Medium risk (40-70%):   {len(med_risk)} customers ({len(med_risk)/len(df):.1%})
+Low risk   (<40%):      {len(low_risk)} customers ({len(low_risk)/len(df):.1%})
+Revenue at risk:        ${high_risk['monthly_spend'].sum():,.2f}/month
+Priority segment:       {len(priority)} customers (high risk + high spend)
+Avg spend high-risk:    ${spend_high:.2f}/month
+Avg spend low-risk:     ${spend_low:.2f}/month
+Avg complaints high-risk: {avg_comp_high:.1f}
+Avg complaints low-risk:  {avg_comp_low:.1f}
+Top churn driver:       {top_driver}
+Top churn protector:    {top_protector}
+Prepaid high-risk:      {len(high_risk[high_risk['plan_type']=='prepaid'])} customers
+Postpaid high-risk:     {len(high_risk[high_risk['plan_type']=='postpaid'])} customers
+
+=== RULES ===
+- Plain English only, no jargon
+- Lead with the direct answer, then evidence
+- Max 4 sentences unless a table genuinely helps
+- Never invent figures not in the summary above
+- If data is unavailable say: "I don't have that data in the current summary"
+"""
+
+def ask_claude(question, system_prompt, api_key):
+    """Send a question to Claude and return the answer as a string."""
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": question}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"Sorry, I couldn't process that question. Error: {str(e)}"
+    
 # ── Load model output ─────────────────────────────
 df, importance = build_model()
 
@@ -241,3 +295,42 @@ st.caption(
     "High-risk customers spend less — prioritise high-risk + high-spend segment."
 )
 
+st.divider()
+st.header("💬 Ask the Data")
+st.caption("Ask any question about your customer churn data in plain English")
+
+# Build system prompt from live model output
+low_risk       = df[df['churn_probability'] < 0.4]
+system_prompt  = build_system_prompt(
+    df, high_risk, med_risk, low_risk, priority, importance)
+
+# Example questions to guide the user
+st.markdown("**Try asking:** What is our biggest churn risk? · "
+           "Which customers should we call first? · "
+           "How does spend differ by risk tier?")
+
+# Query input
+question = st.text_input(
+    "Your question",
+    placeholder="e.g. What is driving churn in our prepaid base?",
+    key="query_input"
+)
+
+# Session state — persists answer across reruns
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
+if "last_question" not in st.session_state:
+    st.session_state.last_question = ""
+
+# Ask button
+if st.button("Ask ↗", type="primary") and question.strip():
+    with st.spinner("Analysing your data..."):
+        answer = ask_claude(question, system_prompt, api_key)
+        st.session_state.last_answer   = answer
+        st.session_state.last_question = question
+
+# Display answer if one exists
+if st.session_state.last_answer:
+    st.markdown(f"**Q: {st.session_state.last_question}**")
+    st.markdown(st.session_state.last_answer)
+    st.caption("Powered by Claude AI · answers based on your data summary")
